@@ -15,10 +15,9 @@ import argparse
 import signal
 import logging
 import queue
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from typing import List, Dict, Any, Optional, Tuple
 
-# Configuration constants
 CHUNK_SIZE = 512
 FORMAT = pyaudio.paFloat32
 CHANNELS = 1
@@ -29,7 +28,9 @@ PREV_AUDIO_SECONDS = 0.5
 MIN_SILENCE_DETECTIONS = 3
 MIN_AUDIO_DURATION = 0.35
 VAD_THRESHOLD = 0.5
-DEVICE = torch.device('cpu')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+is_playing = Lock()
 
 def init_models():
     cache_dir = os.path.expanduser('~/.cache/silero')
@@ -73,15 +74,16 @@ def play_audio(audio: torch.Tensor, pa: pyaudio.PyAudio):
         return
         
     try:
-        stream = pa.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=TTS_RATE,
-            output=True
-        )
-        stream.write(audio.numpy().tobytes())
-        stream.stop_stream()
-        stream.close()
+        with is_playing:
+            stream = pa.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=TTS_RATE,
+                output=True
+            )
+            stream.write(audio.numpy().tobytes())
+            stream.stop_stream()
+            stream.close()
     except Exception as e:
         print(f"Audio playback failed: {e}")
 
@@ -99,7 +101,6 @@ def process_speech_segment(audio_chunks: List[bytes], models: Tuple, pa: pyaudio
     if duration < MIN_AUDIO_DURATION:
         return
     
-    # Transcribe
     wav_tensor = torch.from_numpy(audio_data).to(DEVICE).unsqueeze(0)
     with torch.inference_mode():
         emission = stt_model(wav_tensor)
@@ -110,11 +111,9 @@ def process_speech_segment(audio_chunks: List[bytes], models: Tuple, pa: pyaudio
         
     print(f"\n🗣️ You: {transcription}")
     
-    # Get AI response
     response = get_ai_response(transcription)
     print(f"🤖 Assistant: {response}")
     
-    # Synthesize speech
     try:
         audio = tts_model.apply_tts(
             text=response,
@@ -137,8 +136,13 @@ def process_audio(audio_buffer: queue.Queue, models: Tuple, pa: pyaudio.PyAudio,
     while running.is_set():
         try:
             chunk = audio_buffer.get(timeout=0.1)
+            
+            # Skip VAD if currently playing audio
+            if is_playing.locked():
+                continue
+                
             audio_data = np.frombuffer(chunk, dtype=np.float32).copy()
-            audio_tensor = torch.from_numpy(audio_data)
+            audio_tensor = torch.from_numpy(audio_data).to(DEVICE)
             
             if len(audio_data) != CHUNK_SIZE:
                 continue
@@ -209,6 +213,7 @@ def main():
     )
     
     print("🎤 Voice Assistant Ready (Ctrl+C to exit)")
+    print(f"Using device: {DEVICE}")
     processing_thread.start()
     
     try:
