@@ -32,7 +32,49 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 is_playing = Lock()
 
+def format_for_speech(text: str) -> str:
+    num_dict = {
+        '0': 'zero', '1': 'one', '2': 'two', '3': 'three', '4': 'four',
+        '5': 'five', '6': 'six', '7': 'seven', '8': 'eight', '9': 'nine',
+        '10': 'ten', '11': 'eleven', '12': 'twelve', '13': 'thirteen',
+        '14': 'fourteen', '15': 'fifteen', '16': 'sixteen', '17': 'seventeen',
+        '18': 'eighteen', '19': 'nineteen', '20': 'twenty', '25': 'twenty five',
+        '30': 'thirty', '40': 'forty', '50': 'fifty', '60': 'sixty',
+        '70': 'seventy', '80': 'eighty', '90': 'ninety', '100': 'one hundred',
+        '1000': 'one thousand'
+    }
+    
+    words = text.split()
+    for i, word in enumerate(words):
+        if word.isdigit():
+            if word in num_dict:
+                words[i] = num_dict[word]
+            else:
+                words[i] = ' '.join(num_dict[digit] for digit in word)
+    
+    text = ' '.join(words)
+    
+    replacements = {
+        '%': ' percent',
+        '$': ' dollars',
+        '&': ' and',
+        '+': ' plus',
+        '=': ' equals',
+        '-': ' minus',
+        '*': ' times',
+        '/': ' divided by',
+        '<': ' less than',
+        '>': ' greater than',
+    }
+    
+    for symbol, replacement in replacements.items():
+        text = text.replace(symbol, replacement)
+    
+    return text
+
 def init_models():
+    print("Initializing models... ", end="", flush=True)
+    
     cache_dir = os.path.expanduser('~/.cache/silero')
     tts_path = os.path.join(cache_dir, 'v3_en.pt')
     os.makedirs(cache_dir, exist_ok=True)
@@ -52,6 +94,7 @@ def init_models():
     stt_model.to(DEVICE)
     tts_model.to(DEVICE)
     
+    print("Done!", flush=True)
     return vad_model, stt_model, decoder, tts_model
 
 def get_ai_response(text: str) -> str:
@@ -60,7 +103,7 @@ def get_ai_response(text: str) -> str:
             'http://localhost:11434/api/generate',
             json={
                 'model': 'mistral',
-                'prompt': f"You are a helpful voice assistant. Be concise. User says: {text}",
+                'prompt': f"Reply with a single words or single sentences, don't use lists. User says: {text}",
                 'stream': False
             },
             timeout=30
@@ -117,14 +160,16 @@ def process_speech_segment(audio_chunks: List[bytes], models: Tuple, pa: pyaudio
     print(f"🤖 Assistant: {response}")
     
     try:
-        audio = tts_model.apply_tts(
-            text=response,
-            speaker='en_0',
-            sample_rate=TTS_RATE
-        )
-        play_audio(audio, pa)
+        if len(response.strip()) > 0:
+            formatted_response = format_for_speech(response)
+            audio = tts_model.apply_tts(
+                text=formatted_response,
+                speaker='en_0',
+                sample_rate=TTS_RATE
+            )
+            play_audio(audio, pa)
     except Exception as e:
-        print(f"Speech synthesis failed: {e}")
+        print(f"Speech synthesis failed: {str(e)}")
     
     print("\r🎤 Ready...", end="", flush=True)
 
@@ -139,7 +184,6 @@ def process_audio(audio_buffer: queue.Queue, models: Tuple, pa: pyaudio.PyAudio,
         try:
             chunk = audio_buffer.get(timeout=0.1)
             
-            # Skip VAD if currently playing audio
             if is_playing.locked():
                 continue
                 
@@ -233,6 +277,9 @@ def main():
     
     if args.input_device is not None:
         input_params['input_device_index'] = args.input_device
+    
+    if args.output_device is not None:
+        input_params['output_device_index'] = args.output_device
     
     stream = pa.open(**input_params)
     
