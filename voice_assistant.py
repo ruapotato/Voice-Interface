@@ -73,19 +73,21 @@ def play_audio(audio: torch.Tensor, pa: pyaudio.PyAudio):
     if audio is None:
         return
         
+    is_playing.acquire()
     try:
-        with is_playing:
-            stream = pa.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=TTS_RATE,
-                output=True
-            )
-            stream.write(audio.numpy().tobytes())
-            stream.stop_stream()
-            stream.close()
+        stream = pa.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=TTS_RATE,
+            output=True
+        )
+        stream.write(audio.numpy().tobytes())
+        stream.stop_stream()
+        stream.close()
     except Exception as e:
         print(f"Audio playback failed: {e}")
+    finally:
+        is_playing.release()
 
 def process_speech_segment(audio_chunks: List[bytes], models: Tuple, pa: pyaudio.PyAudio):
     vad_model, stt_model, decoder, tts_model = models
@@ -179,13 +181,36 @@ def process_audio(audio_buffer: queue.Queue, models: Tuple, pa: pyaudio.PyAudio,
 def audio_callback(in_data, frame_count, time_info, status, audio_buffer: queue.Queue, running: Event):
     if not running.is_set():
         return (None, pyaudio.paComplete)
-    audio_buffer.put(in_data)
+    if not is_playing.locked():
+        audio_buffer.put(in_data)
     return (in_data, pyaudio.paContinue)
+
+def list_audio_devices():
+    pa = pyaudio.PyAudio()
+    info = []
+    for i in range(pa.get_device_count()):
+        try:
+            info.append(pa.get_device_info_by_index(i))
+        except OSError:
+            continue
+    pa.terminate()
+    return info
 
 def main():
     parser = argparse.ArgumentParser(description='Voice Assistant')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--list-devices', action='store_true', help='List audio devices')
+    parser.add_argument('--input-device', type=int, help='Input device index')
+    parser.add_argument('--output-device', type=int, help='Output device index')
     args = parser.parse_args()
+    
+    if args.list_devices:
+        devices = list_audio_devices()
+        for i, dev in enumerate(devices):
+            print(f"{i}: {dev['name']}")
+            print(f"   Input channels: {dev['maxInputChannels']}")
+            print(f"   Output channels: {dev['maxOutputChannels']}")
+        return
     
     level = logging.DEBUG if args.debug else logging.ERROR
     logging.basicConfig(level=level, format='[%(levelname)s] %(message)s', stream=sys.stderr)
@@ -197,14 +222,19 @@ def main():
     models = init_models()
     
     pa = pyaudio.PyAudio()
-    stream = pa.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK_SIZE,
-        stream_callback=lambda *args: audio_callback(*args, audio_buffer, running)
-    )
+    input_params = {
+        'format': FORMAT,
+        'channels': CHANNELS,
+        'rate': RATE,
+        'input': True,
+        'frames_per_buffer': CHUNK_SIZE,
+        'stream_callback': lambda *args: audio_callback(*args, audio_buffer, running)
+    }
+    
+    if args.input_device is not None:
+        input_params['input_device_index'] = args.input_device
+    
+    stream = pa.open(**input_params)
     
     processing_thread = Thread(
         target=process_audio,
